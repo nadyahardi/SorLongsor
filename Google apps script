@@ -1,0 +1,190 @@
+/**
+ * ============================================================
+ *  LANDSLIDE EWS — Google Apps Script (GAS)
+ *  Fungsi: Menerima POST dari Gateway ESP32
+ *          Menyimpan ke Google Sheets
+ *          Mengirim notif email jika AWAS/SIAGA
+ * ============================================================
+ *  CARA DEPLOY:
+ *  1. Buka script.google.com → New Project
+ *  2. Copy-paste seluruh kode ini
+ *  3. Deploy → New Deployment → Web App
+ *     - Execute as: Me
+ *     - Who has access: Anyone
+ *  4. Copy URL deployment → paste ke gateway_esp32.ino (GAS_URL)
+ * ============================================================
+ */
+
+// ── KONFIGURASI ────────────────────────────────────────────
+const SHEET_NAME   = "SensorLog";    // Nama tab sheet
+const EMAIL_ALERT  = "email@kamu.com";  // Email penerima alert
+const ALERT_LEVELS = ["SIAGA", "AWAS"]; // Level yang trigger email
+
+// ─────────────────────────────────────────────────────────
+// Handler POST dari Gateway ESP32
+// ─────────────────────────────────────────────────────────
+function doPost(e) {
+  try {
+    // Parse JSON body
+    const data = JSON.parse(e.postData.contents);
+
+    // Validasi field wajib
+    if (!data.timestamp || !data.node_id) {
+      return jsonResponse({ status: "error", message: "Field kurang" });
+    }
+
+    // Simpan ke sheet
+    appendToSheet(data);
+
+    // Kirim email alert jika level tinggi
+    if (ALERT_LEVELS.includes(data.alert)) {
+      sendEmailAlert(data);
+    }
+
+    return jsonResponse({ status: "ok", message: "Data tersimpan" });
+
+  } catch (err) {
+    console.error("Error doPost:", err);
+    return jsonResponse({ status: "error", message: err.toString() });
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// Handler GET (untuk testing dari browser)
+// ─────────────────────────────────────────────────────────
+function doGet(e) {
+  return jsonResponse({ status: "ok", message: "EWS Longsor API aktif" });
+}
+
+// ─────────────────────────────────────────────────────────
+// Simpan data ke Google Sheets
+// ─────────────────────────────────────────────────────────
+function appendToSheet(data) {
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  let   sheet = ss.getSheetByName(SHEET_NAME);
+
+  // Buat sheet baru jika belum ada
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET_NAME);
+    // Tambahkan header
+    sheet.appendRow([
+      "Timestamp", "Node ID",
+      "SM 20cm (%)", "SM 40cm (%)", "SM 60cm (%)", "SM Surface (%)",
+      "Delta SM (%)", "Alert Level",
+      "RSSI (dBm)", "SNR (dB)"
+    ]);
+
+    // Format header
+    const headerRange = sheet.getRange(1, 1, 1, 10);
+    headerRange.setBackground("#1a1a2e");
+    headerRange.setFontColor("#ffffff");
+    headerRange.setFontWeight("bold");
+    sheet.setFrozenRows(1);
+  }
+
+  // Tentukan warna baris berdasarkan alert level
+  const rowData = [
+    data.timestamp,
+    data.node_id,
+    data.sm20   || 0,
+    data.sm40   || 0,
+    data.sm60   || 0,
+    data.sm_surf || 0,
+    data.delta_sm || 0,
+    data.alert  || "UNKNOWN",
+    data.rssi   || 0,
+    data.snr    || 0
+  ];
+
+  sheet.appendRow(rowData);
+
+  // Warnai baris berdasarkan level
+  const lastRow   = sheet.getLastRow();
+  const rowRange  = sheet.getRange(lastRow, 1, 1, 10);
+  const alertColors = {
+    "AMAN"    : "#e8f5e9",  // hijau muda
+    "WASPADA" : "#fff9c4",  // kuning muda
+    "SIAGA"   : "#ffe0b2",  // oranye muda
+    "AWAS"    : "#ffcdd2"   // merah muda
+  };
+  rowRange.setBackground(alertColors[data.alert] || "#ffffff");
+
+  // Auto-resize kolom
+  sheet.autoResizeColumns(1, 10);
+
+  console.log(`Data disimpan: ${data.timestamp} | ${data.node_id} | ${data.alert}`);
+}
+
+// ─────────────────────────────────────────────────────────
+// Kirim email alert
+// ─────────────────────────────────────────────────────────
+function sendEmailAlert(data) {
+  const emoji = data.alert === "AWAS" ? "🔴" : "🟠";
+  const subject = `${emoji} [EWS LONGSOR] ${data.alert} — ${data.node_id}`;
+
+  const body = `
+    <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:auto">
+    <div style="background:#c0392b;color:white;padding:20px;border-radius:8px 8px 0 0">
+      <h2 style="margin:0">${emoji} PERINGATAN LONGSOR — ${data.alert}</h2>
+    </div>
+    <div style="background:#f9f9f9;padding:20px;border:1px solid #ddd;border-top:none;border-radius:0 0 8px 8px">
+      <table style="width:100%;border-collapse:collapse">
+        <tr><td style="padding:8px;color:#666">📍 Node</td>
+            <td style="padding:8px;font-weight:bold">${data.node_id}</td></tr>
+        <tr style="background:#fff"><td style="padding:8px;color:#666">🕐 Waktu</td>
+            <td style="padding:8px">${data.timestamp}</td></tr>
+        <tr><td style="padding:8px;color:#666">🌊 SM 20cm</td>
+            <td style="padding:8px">${data.sm20}%</td></tr>
+        <tr style="background:#fff"><td style="padding:8px;color:#666">🌊 SM 40cm</td>
+            <td style="padding:8px">${data.sm40}%</td></tr>
+        <tr><td style="padding:8px;color:#666">🌊 SM 60cm</td>
+            <td style="padding:8px">${data.sm60}%</td></tr>
+        <tr style="background:#fff"><td style="padding:8px;color:#666">📈 ΔSM</td>
+            <td style="padding:8px">${data.delta_sm}%</td></tr>
+        <tr><td style="padding:8px;color:#666">📡 RSSI</td>
+            <td style="padding:8px">${data.rssi} dBm</td></tr>
+      </table>
+      ${data.alert === "AWAS" ? '<p style="color:red;font-weight:bold;font-size:18px">⚠️ SEGERA EVAKUASI WARGA!</p>' : ''}
+      <p style="color:#888;font-size:12px">Email otomatis dari Sistem EWS Tanah Longsor</p>
+    </div>
+    </body></html>
+  `;
+
+  GmailApp.sendEmail(EMAIL_ALERT, subject, "", { htmlBody: body });
+  console.log(`Email alert terkirim ke ${EMAIL_ALERT}`);
+}
+
+// ─────────────────────────────────────────────────────────
+// Helper: kembalikan JSON response
+// ─────────────────────────────────────────────────────────
+function jsonResponse(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ─────────────────────────────────────────────────────────
+// (OPSIONAL) Fungsi untuk membersihkan data lama
+// Bisa di-trigger otomatis setiap bulan via Time Trigger
+// ─────────────────────────────────────────────────────────
+function deleteOldRows() {
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - 90); // Hapus data > 90 hari
+
+  const data    = sheet.getDataRange().getValues();
+  let   deleted = 0;
+
+  // Loop dari bawah agar index tidak geser
+  for (let i = data.length - 1; i >= 1; i--) {
+    const rowDate = new Date(data[i][0]);
+    if (rowDate < cutoffDate) {
+      sheet.deleteRow(i + 1);
+      deleted++;
+    }
+  }
+  console.log(`Deleted ${deleted} old rows.`);
+}
