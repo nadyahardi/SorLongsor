@@ -1,0 +1,177 @@
+/*
+ * ============================================================
+ *  LANDSLIDE EWS — NODE ESP32
+ *  Hardware : ESP32 + LoRa Ra-02 (SX1278 433MHz)
+ *             4x Capacitive Soil Moisture Sensor v1.2
+ *             Baterai 18650 + TP4056 (dengan Deep Sleep)
+ * ============================================================
+ *  Library  : LoRa by Sandeep Mistry (via Library Manager)
+ * ============================================================
+ */
+
+#include <SPI.h>
+#include <LoRa.h>
+
+// ── PIN LoRa ──────────────────────────────────────────────
+#define LORA_SS    5
+#define LORA_RST   14
+#define LORA_DIO0  2
+#define LORA_FREQ  433E6
+
+// ── PIN Sensor (ADC1 — aman untuk ADC) ────────────────────
+#define SENSOR_20CM  32   // Kedalaman 20 cm
+#define SENSOR_40CM  33   // Kedalaman 40 cm
+#define SENSOR_60CM  34   // Kedalaman 60 cm
+#define SENSOR_SPARE 35   // Cadangan / permukaan
+
+// ── KALIBRASI Sensor (sesuaikan setelah pengukuran nyata) ─
+// Nilai ADC: udara kering ≈ 4095, air penuh ≈ 1800 (kapasitif v1.2)
+#define CAL_DRY    3200   // Nilai ADC kondisi tanah kering
+#define CAL_WET    1500   // Nilai ADC kondisi tanah jenuh air
+
+// ── THRESHOLD 3D (sesuaikan dengan data lapangan) ─────────
+// Berdasarkan metodologi Lee et al. (2023)
+#define THRESH_WASPADA  55.0  // % kelembapan → Level WASPADA
+#define THRESH_SIAGA    70.0  // % kelembapan → Level SIAGA
+#define THRESH_AWAS     85.0  // % kelembapan → Level AWAS
+
+// ── INTERVAL & DEEP SLEEP ─────────────────────────────────
+#define TRANSMIT_INTERVAL_SEC  300  // Kirim data setiap 5 menit
+#define uS_TO_S_FACTOR         1000000ULL
+
+// ── ID NODE ───────────────────────────────────────────────
+#define NODE_ID  "NODE_01"
+
+// ── RTC Memory (tetap saat deep sleep) ───────────────────
+RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR float apiAccumulator = 0.0;  // API: Antecedent Precipitation Index
+
+// ─────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  bootCount++;
+  Serial.printf("\n=== BOOT #%d ===\n", bootCount);
+
+  // ── Inisialisasi LoRa ─────────────────────────────────
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("[ERROR] LoRa init gagal!");
+    goToSleep(); // jangan buang baterai jika error
+  }
+
+  // Konfigurasi LoRa untuk jangkauan maksimal
+  LoRa.setSpreadingFactor(9);        // SF9 — balance range vs waktu
+  LoRa.setSignalBandwidth(125E3);    // BW 125 kHz
+  LoRa.setCodingRate4(5);            // CR 4/5
+  LoRa.setTxPower(17);               // 17 dBm (max aman Ra-02)
+  LoRa.enableCrc();
+
+  Serial.println("[OK] LoRa ready");
+
+  // ── Baca Sensor ──────────────────────────────────────
+  float sm20 = readMoisturePct(SENSOR_20CM);
+  float sm40 = readMoisturePct(SENSOR_40CM);
+  float sm60 = readMoisturePct(SENSOR_60CM);
+  float smSurface = readMoisturePct(SENSOR_SPARE);
+
+  // ── Hitung Delta SM (perubahan kelembapan) ────────────
+  // Rata-rata selisih antar layer = proxy infiltrasi
+  float deltaSM = ((sm40 - sm20) + (sm60 - sm40)) / 2.0;
+  deltaSM = constrain(deltaSM, -100.0, 100.0);
+
+  // ── Tentukan Level Bahaya (3D Thresholding) ───────────
+  // Ambil nilai tertinggi dari 3 kedalaman
+  float smMax = max(sm20, max(sm40, sm60));
+  String alertLevel = determineAlert(smMax, deltaSM);
+
+  // ── Format payload JSON ───────────────────────────────
+  String payload = buildPayload(sm20, sm40, sm60, smSurface, deltaSM, alertLevel);
+
+  Serial.println("Payload: " + payload);
+
+  // ── Kirim via LoRa ────────────────────────────────────
+  LoRa.beginPacket();
+  LoRa.print(payload);
+  int sent = LoRa.endPacket();
+
+  if (sent) {
+    Serial.println("[OK] Data terkirim via LoRa");
+  } else {
+    Serial.println("[FAIL] LoRa transmit gagal");
+  }
+
+  delay(100);
+  goToSleep();
+}
+
+void loop() {
+  // Tidak digunakan — semua logika di setup() karena pakai deep sleep
+}
+
+// ─────────────────────────────────────────────────────────
+// Baca sensor dan konversi ke persen (0–100%)
+// ─────────────────────────────────────────────────────────
+float readMoisturePct(int pin) {
+  // Multi-sampling untuk mengurangi noise ADC
+  long sum = 0;
+  const int samples = 10;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delay(10);
+  }
+  int rawAvg = sum / samples;
+
+  // Map: kering (CAL_DRY) = 0%, basah (CAL_WET) = 100%
+  float pct = map(rawAvg, CAL_DRY, CAL_WET, 0, 100);
+  return constrain(pct, 0.0, 100.0);
+}
+
+// ─────────────────────────────────────────────────────────
+// 3D Thresholding: tentukan level alert
+// ─────────────────────────────────────────────────────────
+String determineAlert(float smMax, float deltaSM) {
+  // Level AWAS: kelembapan sangat tinggi DAN ada pergerakan infiltrasi
+  if (smMax >= THRESH_AWAS && deltaSM >= 5.0) {
+    return "AWAS";
+  }
+  // Level SIAGA: kelembapan tinggi ATAU gradien besar
+  if (smMax >= THRESH_SIAGA || (smMax >= THRESH_WASPADA && deltaSM >= 10.0)) {
+    return "SIAGA";
+  }
+  // Level WASPADA: kelembapan mulai meningkat
+  if (smMax >= THRESH_WASPADA) {
+    return "WASPADA";
+  }
+  return "AMAN";
+}
+
+// ─────────────────────────────────────────────────────────
+// Build JSON payload
+// ─────────────────────────────────────────────────────────
+String buildPayload(float sm20, float sm40, float sm60,
+                    float smSurf, float deltaSM, String alert) {
+  String json = "{";
+  json += "\"id\":\"" + String(NODE_ID) + "\",";
+  json += "\"boot\":" + String(bootCount) + ",";
+  json += "\"sm20\":" + String(sm20, 1) + ",";
+  json += "\"sm40\":" + String(sm40, 1) + ",";
+  json += "\"sm60\":" + String(sm60, 1) + ",";
+  json += "\"sm_surf\":" + String(smSurf, 1) + ",";
+  json += "\"delta_sm\":" + String(deltaSM, 2) + ",";
+  json += "\"alert\":\"" + alert + "\"";
+  json += "}";
+  return json;
+}
+
+// ─────────────────────────────────────────────────────────
+// Masuk Deep Sleep
+// ─────────────────────────────────────────────────────────
+void goToSleep() {
+  Serial.printf("[SLEEP] Tidur %d detik...\n", TRANSMIT_INTERVAL_SEC);
+  Serial.flush();
+  LoRa.sleep();
+  esp_sleep_enable_timer_wakeup(TRANSMIT_INTERVAL_SEC * uS_TO_S_FACTOR);
+  esp_deep_sleep_start();
+}
