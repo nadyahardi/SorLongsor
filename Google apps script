@@ -52,8 +52,62 @@ function doPost(e) {
 // ─────────────────────────────────────────────────────────
 // Handler GET (untuk testing dari browser)
 // ─────────────────────────────────────────────────────────
+/**
+ * Tambahkan fungsi doGet yang sudah diupdate ini ke google_apps_script.js kamu
+ * Ganti fungsi doGet yang lama dengan yang ini
+ */
+
 function doGet(e) {
-  return jsonResponse({ status: "ok", message: "EWS Longsor API aktif" });
+  const action = e.parameter.action;
+
+  if (action === 'getLogs') {
+    const limit = parseInt(e.parameter.limit) || 20;
+    return getLogsJSON(limit);
+  }
+
+  return jsonResponse({ status: 'ok', message: 'EWS Longsor API aktif' });
+}
+
+function getLogsJSON(limit) {
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+
+  if (!sheet) {
+    return jsonResponseWithCORS({ data: [], message: 'Sheet belum ada data' });
+  }
+
+  const allData = sheet.getDataRange().getValues();
+  if (allData.length <= 1) {
+    return jsonResponseWithCORS({ data: [] });
+  }
+
+  const headers = allData[0];
+  const rows    = allData.slice(1);
+
+  // Ambil N baris terakhir
+  const recentRows = rows.slice(-limit);
+
+  const result = recentRows.map(row => ({
+    timestamp : row[0] ? Utilities.formatDate(new Date(row[0]), 'Asia/Jakarta', 'yyyy-MM-dd HH:mm:ss') : '',
+    node_id   : row[1],
+    sm20      : parseFloat(row[2]) || 0,
+    sm40      : parseFloat(row[3]) || 0,
+    sm60      : parseFloat(row[4]) || 0,
+    sm_surf   : parseFloat(row[5]) || 0,
+    delta_sm  : parseFloat(row[6]) || 0,
+    alert     : row[7] || 'AMAN',
+    rssi      : parseInt(row[8])  || 0,
+    snr       : parseFloat(row[9]) || 0
+  }));
+
+  return jsonResponseWithCORS({ data: result });
+}
+
+// CORS-aware response (agar bisa diakses dari web dashboard)
+function jsonResponseWithCORS(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 // ─────────────────────────────────────────────────────────
