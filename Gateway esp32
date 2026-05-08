@@ -1,0 +1,310 @@
+/*
+ * ============================================================
+ *  LANDSLIDE EWS — GATEWAY ESP32
+ *  Hardware : ESP32 + LoRa Ra-02 (SX1278 433MHz)
+ *             Terhubung ke listrik (adaptor/USB)
+ *             Akses Internet via WiFi
+ * ============================================================
+ *  Library  : LoRa by Sandeep Mistry
+ *             ArduinoJson by Benoit Blanchon
+ * ============================================================
+ */
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// ── KONFIGURASI — SESUAIKAN SEBELUM UPLOAD ────────────────
+const char* WIFI_SSID     = "NAMA_WIFI_KAMU";
+const char* WIFI_PASS     = "PASSWORD_WIFI";
+
+// Google Apps Script Web App URL (dapatkan setelah deploy GAS)
+const char* GAS_URL       = "https://script.google.com/macros/s/XXXXXXX/exec";
+
+// Fonnte API (https://fonnte.com — daftar gratis)
+const char* FONNTE_TOKEN  = "TOKEN_FONNTE_KAMU";
+const char* WA_TARGET     = "6281234567890";   // Nomor WA tujuan (tanpa +)
+
+// ── PIN LoRa ──────────────────────────────────────────────
+#define LORA_SS    5
+#define LORA_RST   14
+#define LORA_DIO0  2
+#define LORA_FREQ  433E6
+
+// ── KONFIGURASI WAKTU (NTP) ───────────────────────────────
+const char* NTP_SERVER    = "pool.ntp.org";
+const long  GMT_OFFSET    = 25200;  // UTC+7 (WIB) = 7*3600
+const int   DST_OFFSET    = 0;
+
+// ── COOLDOWN NOTIF WA (hindari spam) ─────────────────────
+// Kirim WA minimal setiap X menit untuk level yang sama
+#define WA_COOLDOWN_SIAGA_MIN   15
+#define WA_COOLDOWN_AWAS_MIN    5
+
+unsigned long lastWaSiaga = 0;
+unsigned long lastWaAwas  = 0;
+
+// ─────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== GATEWAY EWS TANAH LONGSOR ===");
+
+  // ── Konek WiFi ────────────────────────────────────────
+  connectWiFi();
+
+  // ── Sync NTP ──────────────────────────────────────────
+  configTime(GMT_OFFSET, DST_OFFSET, NTP_SERVER);
+  Serial.print("[NTP] Sync waktu");
+  struct tm timeinfo;
+  while (!getLocalTime(&timeinfo)) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println(" OK");
+  Serial.printf("[NTP] Waktu: %02d:%02d:%02d\n",
+    timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+  // ── Inisialisasi LoRa ─────────────────────────────────
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("[ERROR] LoRa init gagal!");
+    while (true) delay(1000);
+  }
+
+  // Harus identik dengan konfigurasi Node
+  LoRa.setSpreadingFactor(9);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.enableCrc();
+
+  Serial.println("[OK] LoRa Gateway siap menerima...");
+  Serial.println("─────────────────────────────────");
+}
+
+void loop() {
+  // ── Cek paket LoRa masuk ─────────────────────────────
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    processLoRaPacket(packetSize);
+  }
+
+  // ── Cek koneksi WiFi & reconnect jika putus ───────────
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WIFI] Koneksi putus, reconnect...");
+    connectWiFi();
+  }
+
+  delay(10);
+}
+
+// ─────────────────────────────────────────────────────────
+// Proses paket LoRa yang diterima
+// ─────────────────────────────────────────────────────────
+void processLoRaPacket(int packetSize) {
+  // Baca payload
+  String payload = "";
+  while (LoRa.available()) {
+    payload += (char)LoRa.read();
+  }
+  int rssi = LoRa.packetRssi();
+  float snr  = LoRa.packetSnr();
+
+  Serial.println("\n[LoRa] Paket diterima!");
+  Serial.println("Payload : " + payload);
+  Serial.printf("RSSI    : %d dBm\n", rssi);
+  Serial.printf("SNR     : %.1f dB\n", snr);
+
+  // ── Parse JSON ───────────────────────────────────────
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.println("[ERROR] JSON parse gagal: " + String(error.c_str()));
+    return;
+  }
+
+  // Ekstrak nilai
+  String nodeId   = doc["id"].as<String>();
+  int    boot     = doc["boot"];
+  float  sm20     = doc["sm20"];
+  float  sm40     = doc["sm40"];
+  float  sm60     = doc["sm60"];
+  float  smSurf   = doc["sm_surf"];
+  float  deltaSM  = doc["delta_sm"];
+  String alert    = doc["alert"].as<String>();
+
+  // Ambil timestamp
+  String timestamp = getTimestamp();
+
+  Serial.printf("[DATA] %s | SM: %.1f/%.1f/%.1f | ΔSM: %.2f | Alert: %s\n",
+    nodeId.c_str(), sm20, sm40, sm60, deltaSM, alert.c_str());
+
+  // ── Kirim ke Google Sheets ────────────────────────────
+  sendToGoogleSheets(timestamp, nodeId, sm20, sm40, sm60,
+                     smSurf, deltaSM, alert, rssi, snr);
+
+  // ── Kirim Notif WA jika alert ─────────────────────────
+  if (alert == "AWAS" || alert == "SIAGA" || alert == "WASPADA") {
+    sendWhatsAppAlert(timestamp, nodeId, sm20, sm40, sm60, deltaSM, alert, rssi);
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// Kirim data ke Google Apps Script → Google Sheets
+// ─────────────────────────────────────────────────────────
+void sendToGoogleSheets(String ts, String nodeId,
+                        float sm20, float sm40, float sm60,
+                        float smSurf, float deltaSM,
+                        String alert, int rssi, float snr) {
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(GAS_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // GAS pakai redirect
+
+  // Build JSON body
+  String body = "{";
+  body += "\"timestamp\":\"" + ts + "\",";
+  body += "\"node_id\":\"" + nodeId + "\",";
+  body += "\"sm20\":"    + String(sm20, 1)    + ",";
+  body += "\"sm40\":"    + String(sm40, 1)    + ",";
+  body += "\"sm60\":"    + String(sm60, 1)    + ",";
+  body += "\"sm_surf\":" + String(smSurf, 1)  + ",";
+  body += "\"delta_sm\":" + String(deltaSM, 2) + ",";
+  body += "\"alert\":\""  + alert + "\",";
+  body += "\"rssi\":"    + String(rssi)        + ",";
+  body += "\"snr\":"     + String(snr, 1);
+  body += "}";
+
+  int httpCode = http.POST(body);
+
+  if (httpCode == HTTP_CODE_OK || httpCode == 302) {
+    Serial.println("[GSheets] Data terkirim ✓");
+  } else {
+    Serial.printf("[GSheets] Error HTTP %d\n", httpCode);
+  }
+  http.end();
+}
+
+// ─────────────────────────────────────────────────────────
+// Kirim notifikasi WhatsApp via Fonnte API
+// ─────────────────────────────────────────────────────────
+void sendWhatsAppAlert(String ts, String nodeId,
+                       float sm20, float sm40, float sm60,
+                       float deltaSM, String alert, int rssi) {
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  // Cooldown check
+  unsigned long now = millis();
+  if (alert == "AWAS") {
+    if ((now - lastWaAwas) < (WA_COOLDOWN_AWAS_MIN * 60000UL) && lastWaAwas != 0) {
+      Serial.println("[WA] Cooldown AWAS aktif, skip.");
+      return;
+    }
+    lastWaAwas = now;
+  } else {
+    if ((now - lastWaSiaga) < (WA_COOLDOWN_SIAGA_MIN * 60000UL) && lastWaSiaga != 0) {
+      Serial.println("[WA] Cooldown SIAGA/WASPADA aktif, skip.");
+      return;
+    }
+    lastWaSiaga = now;
+  }
+
+  // Emoji berdasarkan level
+  String emoji = "🟡";
+  if (alert == "SIAGA") emoji = "🟠";
+  if (alert == "AWAS")  emoji = "🔴";
+
+  // Format pesan WA
+  String msg = emoji + " *PERINGATAN LONGSOR — " + alert + "*\n\n";
+  msg += "📍 Node: " + nodeId + "\n";
+  msg += "🕐 Waktu: " + ts + "\n\n";
+  msg += "📊 *Data Kelembapan Tanah:*\n";
+  msg += "• Kedalaman 20cm : " + String(sm20, 1) + "%\n";
+  msg += "• Kedalaman 40cm : " + String(sm40, 1) + "%\n";
+  msg += "• Kedalaman 60cm : " + String(sm60, 1) + "%\n";
+  msg += "• ΔSM (gradien)  : " + String(deltaSM, 2) + "%\n\n";
+
+  if (alert == "AWAS") {
+    msg += "⚠️ *SEGERA EVAKUASI! Saturasi tanah kritis.*\n";
+  } else if (alert == "SIAGA") {
+    msg += "⚠️ Waspada tinggi. Pantau terus kondisi lereng.\n";
+  } else {
+    msg += "ℹ️ Kelembapan mulai meningkat. Tetap pantau.\n";
+  }
+  msg += "\n📡 Sinyal: " + String(rssi) + " dBm";
+
+  // Kirim via Fonnte
+  HTTPClient http;
+  http.begin("https://api.fonnte.com/send");
+  http.addHeader("Authorization", FONNTE_TOKEN);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData = "target=" + String(WA_TARGET);
+  postData += "&message=" + urlEncode(msg);
+  postData += "&countryCode=62";
+
+  int httpCode = http.POST(postData);
+  if (httpCode == HTTP_CODE_OK) {
+    Serial.println("[WA] Notifikasi terkirim ✓ → " + String(WA_TARGET));
+  } else {
+    Serial.printf("[WA] Error HTTP %d\n", httpCode);
+  }
+  http.end();
+}
+
+// ─────────────────────────────────────────────────────────
+// Koneksi WiFi
+// ─────────────────────────────────────────────────────────
+void connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("[WiFi] Menghubungkan ke " + String(WIFI_SSID));
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Terhubung! IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n[WiFi] GAGAL terhubung. Cek SSID/password.");
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// Ambil timestamp dari NTP
+// ─────────────────────────────────────────────────────────
+String getTimestamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "00:00:00";
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+// ─────────────────────────────────────────────────────────
+// URL Encode sederhana untuk pesan WA
+// ─────────────────────────────────────────────────────────
+String urlEncode(String str) {
+  String encoded = "";
+  for (int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (c == ' ')  encoded += "%20";
+    else if (c == '\n') encoded += "%0A";
+    else if (c == '*')  encoded += "%2A";
+    else if (c == '#')  encoded += "%23";
+    else if (c == '&')  encoded += "%26";
+    else if (c == '=')  encoded += "%3D";
+    else if (c == '+')  encoded += "%2B";
+    else if (c == '%')  encoded += "%25";
+    else encoded += c;
+  }
+  return encoded;
+}
